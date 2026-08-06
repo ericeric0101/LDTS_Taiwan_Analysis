@@ -1,0 +1,12 @@
+[project]
+name = "ldts-market-intelligence"
+version = "0.1.0"
+description = "Conservative collector and parser for Taiwan MOHW LDTS public records."
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31", "beautifulsoup4>=4.12", "lxml>=5.0", "pandas>=2.0", "typer>=0.12", "pyyaml>=6.0"]
+
+[project.scripts]
+ldts = "ldts.cli:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

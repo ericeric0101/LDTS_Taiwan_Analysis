@@ -1,0 +1,8 @@
+base_url: "https://ldts.mohw.gov.tw/main_ch/apyList.aspx?uid=2155&pid=63"
+request_delay_seconds: 3
+request_timeout_seconds: 30
+max_retries: 3
+cache_enabled: true
+user_agent: "LDTSResearchBot/0.1 (public-data research; contact: replace-me@example.org)"
+raw_data_directory: "data/raw"
+processed_data_directory: "data/processed"
