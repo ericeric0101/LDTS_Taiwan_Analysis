@@ -151,14 +151,20 @@ def parse(path: Path, output: Path = Path("data/processed/records.csv")):
     typer.echo(f"解析 {len(rows)} 筆：{output}")
 
 @app.command("analyze")
-def analyze(input_csv: list[Path] = typer.Option(None, "--input-csv", help="可重複指定多個 CSV"), output_dir: Path = typer.Option(Path("reports/taiwan_preview"), "--output-dir"), category: list[str] = typer.Option(None, "--category", help="可重複指定檢測類別；未指定則分析全部")):
+def analyze(input_csv: list[Path] = typer.Option(None, "--input-csv", help="可重複指定多個 CSV"), output_dir: Path = typer.Option(Path("reports/taiwan_preview"), "--output-dir"), category: list[str] = typer.Option(None, "--category", help="可重複指定檢測類別"), all_categories: bool = typer.Option(False, "--all-categories", help="忽略 target_categories.txt，分析全部類別")):
     """合併一個或多個 CSV，產生摘要表與 HTML 分析報告。"""
     paths = input_csv or [Path("data/processed/taipei_preview.csv")]
     missing = [str(p) for p in paths if not p.exists()]
     if missing: raise typer.BadParameter("找不到 CSV：" + ", ".join(missing))
-    report = build_report(paths, output_dir, category or None)
+    selected_categories = category or None
+    if not selected_categories and not all_categories:
+        target_file = Path("config/target_categories.txt")
+        if target_file.exists():
+            selected_categories = [x.strip() for x in target_file.read_text(encoding="utf-8-sig").splitlines() if x.strip() and not x.startswith("#")]
+    report = build_report(paths, output_dir, selected_categories)
     typer.echo(f"合併檔案：{len(paths)} 個")
-    if category: typer.echo(f"分析類別：{', '.join(category)}")
+    if selected_categories: typer.echo(f"分析類別：{', '.join(selected_categories)}")
+    elif all_categories: typer.echo("分析類別：全部")
     typer.echo(f"分析完成：{report}")
 
 if __name__ == "__main__": app()
