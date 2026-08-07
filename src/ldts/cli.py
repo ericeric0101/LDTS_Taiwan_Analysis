@@ -3,19 +3,27 @@ from urllib.parse import urlencode
 import csv, typer, json, hashlib
 from datetime import datetime, timezone
 from .scraper.client import Client
-from .scraper.parser import parse_table
+from .scraper.parser import case_id_series, normalize_case_id, parse_table
 from .processing.cleaner import enrich
 from .analysis.report import build_report
 app = typer.Typer()
 
 def _quality(rows):
     required = ["案件編號", "縣市", "醫療機構名稱", "檢測項目名稱"]
-    ids = [r.get("案件編號", "") for r in rows]
-    return {"rows": len(rows), "unique_case_ids": len(set(ids)), "duplicate_case_ids": len(ids) - len(set(ids)), "missing_required": sum(any(not r.get(k) for k in required) for r in rows)}
+    ids = [normalize_case_id(r.get("案件編號", "")) for r in rows]
+    series_counts = {}
+    for case_id in ids:
+        series = case_id_series(case_id)
+        series_counts[series] = series_counts.get(series, 0) + 1
+    return {"rows": len(rows), "unique_case_ids": len(set(ids)), "duplicate_case_ids": len(ids) - len(set(ids)), "missing_required": sum(any(not r.get(k) for k in required) for r in rows), "case_id_series": series_counts}
 
 @app.command("scrape")
 def scrape(
     city: str = typer.Option("", help="縣市；目前先以取得頁面後本地篩選"),
+    institution: str = typer.Option("", "--institution", help="醫療機構名稱；送至網站表單查詢"),
+    test_name: str = typer.Option("", "--test-name", help="檢測項目名稱；送至網站表單查詢"),
+    lab_name: str = typer.Option("", "--lab-name", help="認證實驗室名稱；送至網站表單查詢"),
+    local_lab_name: str = typer.Option("", "--local-lab-name", help="本機以認證實驗室名稱部分比對；仍會抓取該縣市所有頁面"),
     max_pages: int = typer.Option(1, "--max-pages", min=1, max=200),
     url: str = typer.Option("https://ldts.mohw.gov.tw/main_ch/apyList.aspx?uid=2155&pid=63"),
     output: Path = typer.Option(Path("data/processed/taipei_preview.csv")),
@@ -43,13 +51,18 @@ def scrape(
                 client.get(url, force=True)  # 建立新的 session/cookies，再以快取頁面的 ViewState 繼續
                 typer.echo(f"續抓：既有 {len(all_rows)} 筆，從第 {start_page} 頁開始")
     if start_page == 1:
-        html, raw_path = client.get(url)
-        query_html = client.aspnet_postback(url, html, "ctl00$ContentPlaceHolder1$lkb_sh", {"ctl00$ContentPlaceHolder1$txt_city": city})
+        html, raw_path = client.get(url, force=True)
+        query_html = client.aspnet_postback(url, html, "ctl00$ContentPlaceHolder1$lkb_sh", {
+            "ctl00$ContentPlaceHolder1$txt_city": city,
+            "ctl00$ContentPlaceHolder1$txt_MIname": institution,
+            "ctl00$ContentPlaceHolder1$txtName": test_name,
+            "ctl00$ContentPlaceHolder1$txtLabName": lab_name,
+        })
         query_path = client.save(url, query_html, "query")
         typer.echo(f"查詢結果 raw={query_path}")
         pages_meta.append({"page": 1, "kind": "query", "raw_path": str(query_path), "sha256": hashlib.sha256(query_html.encode()).hexdigest()})
         current_html = query_html
-    seen_ids = set(r.get("案件編號") for r in all_rows if r.get("案件編號"))
+    seen_ids = {normalize_case_id(r.get("案件編號", "")) for r in all_rows if r.get("案件編號")}
     duplicate_pages = []
     for page in range(start_page, max_pages + 1):
         request_url = url
@@ -57,7 +70,11 @@ def scrape(
             rows = parse_table(current_html)
         except Exception as exc:
             raise typer.BadParameter(f"第 {page} 頁抓取或解析失敗：{exc}") from exc
-        row_ids = {r.get("案件編號") for r in rows if r.get("案件編號")}
+        page_row_count = len(rows)
+        if local_lab_name:
+            keyword = local_lab_name.casefold()
+            rows = [row for row in rows if keyword in row.get("認證實驗室名稱", "").casefold()]
+        row_ids = {normalize_case_id(r.get("案件編號", "")) for r in rows if r.get("案件編號")}
         repeated = row_ids & seen_ids
         actual_page = client.current_page_number(current_html) or page
         if repeated:
@@ -65,7 +82,10 @@ def scrape(
             typer.echo(f"警告：第 {actual_page} 頁與既有資料重複 {len(repeated)} 筆，停止以避免污染資料")
             break
         all_rows.extend(enrich(r) for r in rows); seen_ids.update(row_ids)
-        typer.echo(f"第 {actual_page} 頁：{len(rows)} 筆")
+        if local_lab_name:
+            typer.echo(f"第 {actual_page} 頁：原始 {page_row_count} 筆，實驗室篩選後 {len(rows)} 筆")
+        else:
+            typer.echo(f"第 {actual_page} 頁：{len(rows)} 筆")
         if actual_page >= max_pages:
             break
         page = actual_page
@@ -93,7 +113,7 @@ def scrape(
     typer.echo(f"人工複核清單：{review_path}（{len(review_rows)} 筆）")
     quality = _quality(all_rows)
     quality_path = output.with_name(output.stem + "_quality.json")
-    quality.update({"run_id": run_id, "started_at": started_at, "finished_at": datetime.now(timezone.utc).isoformat(), "city": city, "source_url": url, "pages": len(pages_meta), "raw_pages": pages_meta, "duplicate_pages": duplicate_pages, "manual_review_count": sum(bool(r.get("manual_review_required")) for r in all_rows)})
+    quality.update({"run_id": run_id, "started_at": started_at, "finished_at": datetime.now(timezone.utc).isoformat(), "city": city, "filters": {"institution": institution, "test_name": test_name, "lab_name": lab_name, "local_lab_name": local_lab_name}, "source_url": url, "pages": len(pages_meta), "raw_pages": pages_meta, "duplicate_pages": duplicate_pages, "manual_review_count": sum(bool(r.get("manual_review_required")) for r in all_rows)})
     quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
     typer.echo(f"品質報告：{quality_path}")
     typer.echo(f"品質檢查：{_quality(all_rows)}")
@@ -151,7 +171,7 @@ def parse(path: Path, output: Path = Path("data/processed/records.csv")):
     typer.echo(f"解析 {len(rows)} 筆：{output}")
 
 @app.command("analyze")
-def analyze(input_csv: list[Path] = typer.Option(None, "--input-csv", help="可重複指定多個 CSV"), output_dir: Path = typer.Option(Path("reports/taiwan_preview"), "--output-dir"), category: list[str] = typer.Option(None, "--category", help="可重複指定檢測類別"), all_categories: bool = typer.Option(False, "--all-categories", help="忽略 target_categories.txt，分析全部類別")):
+def analyze(input_csv: list[Path] = typer.Option(None, "--input-csv", help="可重複指定多個 CSV"), output_dir: Path = typer.Option(Path("reports/taiwan_preview"), "--output-dir"), category: list[str] = typer.Option(None, "--category", help="可重複指定檢測類別"), all_categories: bool = typer.Option(False, "--all-categories", help="忽略 target_categories.txt，分析全部類別"), reference_year: int = typer.Option(None, "--reference-year", min=2000, max=2100, help="年份追蹤比較基準；預設為今年")):
     """合併一個或多個 CSV，產生摘要表與 HTML 分析報告。"""
     paths = input_csv or [Path("data/processed/taipei_preview.csv")]
     missing = [str(p) for p in paths if not p.exists()]
@@ -161,10 +181,11 @@ def analyze(input_csv: list[Path] = typer.Option(None, "--input-csv", help="可�
         target_file = Path("config/target_categories.txt")
         if target_file.exists():
             selected_categories = [x.strip() for x in target_file.read_text(encoding="utf-8-sig").splitlines() if x.strip() and not x.startswith("#")]
-    report = build_report(paths, output_dir, selected_categories)
+    report = build_report(paths, output_dir, selected_categories, reference_year=reference_year)
     typer.echo(f"合併檔案：{len(paths)} 個")
     if selected_categories: typer.echo(f"分析類別：{', '.join(selected_categories)}")
     elif all_categories: typer.echo("分析類別：全部")
+    if reference_year: typer.echo(f"年份追蹤基準年：{reference_year}")
     typer.echo(f"分析完成：{report}")
 
 if __name__ == "__main__": app()

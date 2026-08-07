@@ -1,4 +1,4 @@
-from ldts.processing.cleaner import parse_price, parse_genes, normalize_name
+from ldts.processing.cleaner import parse_application_year, parse_price, parse_genes, normalize_name, normalize_test_name
 
 def test_price_range():
     x = parse_price("血液：4,000 元")
@@ -23,3 +23,13 @@ def test_zero_gene_count_is_unknown():
     x = enrich(row)
     assert x["panel_size_group"] == "unknown"
     assert x["price_per_gene_twd"] == ""
+
+def test_application_year_supports_ldt_variants():
+    assert parse_application_year("2024LDT0026") == 2024
+    assert parse_application_year("2023LDTB0064") == 2023
+    assert parse_application_year("2026LDTS00053") == 2026
+    assert parse_application_year("not-a-case") == ""
+
+def test_test_name_comparison_key_is_conservative():
+    assert normalize_test_name("NIPT-1.0（經典款）") == normalize_test_name("NIPT 1.0 經典款")
+    assert normalize_test_name("NIPT-1.0") != normalize_test_name("NIPT-2.0")

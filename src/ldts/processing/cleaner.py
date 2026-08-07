@@ -1,10 +1,12 @@
 from __future__ import annotations
+from datetime import date
 import re
 import unicodedata
 
 def normalize_name(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "")
-    value = re.sub(r"[\s　]+", "", value)
+    value = re.sub(r"[\s　]+", " ", value).strip()
+    value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
     return value.replace("台", "臺")
 
 def parse_price(raw: str) -> dict[str, object]:
@@ -36,12 +38,25 @@ def parse_genes(raw: str) -> dict[str, object]:
     confidence = "low" if broad or not genes else ("medium" if len(genes) > 50 else "high")
     return {"extracted_genes": ";".join(genes), "gene_count_final": len(genes) if not broad else "", "gene_count_method": "explicit_list" if genes and not broad else ("exome_not_applicable" if broad else "unknown"), "gene_parse_confidence": confidence, "gene_parse_warning": warning}
 
-def enrich(row: dict[str, str]) -> dict[str, object]:
+def parse_application_year(case_id: str) -> int | str:
+    """Extract the leading year from official LDT/LDTB/LDTS identifiers."""
+    match = re.match(r"^(20\d{2})LDT[A-Z]*\d+$", re.sub(r"\s+", "", case_id or "").upper())
+    return int(match.group(1)) if match else ""
+
+def normalize_test_name(value: str) -> str:
+    """Conservative comparison key; keep version numbers meaningful."""
+    return re.sub(r"[\s\-_/、，,()（）]+", "", unicodedata.normalize("NFKC", value or "")).casefold()
+
+def enrich(row: dict[str, str], reference_year: int | None = None) -> dict[str, object]:
     out = dict(row)
     out.update(parse_price(row.get("費用(新台幣)", row.get("費用（新台幣）", ""))))
     out.update(parse_genes(row.get("分析標的", "")))
     out["medical_institution_name_normalized"] = normalize_name(row.get("醫療機構名稱", ""))
     out["accredited_lab_name_normalized"] = normalize_name(row.get("認證實驗室名稱", ""))
+    application_year = parse_application_year(str(row.get("案件編號", "")))
+    out["application_year"] = application_year
+    current_year = reference_year if reference_year is not None else date.today().year
+    out["years_since_application"] = current_year - application_year if application_year else ""
     count = out.get("gene_count_final")
     if isinstance(count, int) and count > 0:
         out["panel_size_group"] = "single_gene" if count == 1 else "very_small_panel" if count <= 10 else "small_panel" if count <= 50 else "medium_panel" if count <= 200 else "large_panel" if count <= 500 else "very_large_panel"
