@@ -3,10 +3,43 @@ from urllib.parse import urlencode
 import csv, typer, json, hashlib
 from datetime import datetime, timezone
 from .scraper.client import Client
-from .scraper.parser import case_id_series, normalize_case_id, parse_table
+from .scraper.parser import FIELDS, case_id_series, normalize_case_id, parse_table
+from .scraper.portal import PORTAL_SEARCH_URL, PortalClient
+from .processing.geography import normalize_city_rows
 from .processing.cleaner import enrich
 from .analysis.report import build_report
 app = typer.Typer()
+
+
+def _normalized_text(value: str) -> str:
+    """Normalize display variations without altering the source value."""
+    return "".join((value or "").casefold().split()).replace("台", "臺")
+
+
+def _query_result_is_verified(rows: list[dict[str, str]], *, city: str, institution: str, test_name: str, lab_name: str) -> bool:
+    """Return whether every returned row satisfies the filters sent to the site.
+
+    The legacy site sometimes returns its unfiltered default listing with HTTP 200
+    when it does not accept an automated form postback.  Treat that as a failed
+    query rather than silently writing misleading CSV data.
+    """
+    checks = (
+        ("縣市", city, True),
+        ("醫療機構名稱", institution, False),
+        ("檢測項目名稱", test_name, False),
+        ("認證實驗室名稱", lab_name, False),
+    )
+    for column, requested, exact in checks:
+        needle = _normalized_text(requested)
+        if not needle:
+            continue
+        values = [_normalized_text(row.get(column, "")) for row in rows]
+        if exact:
+            if not all(value == needle for value in values):
+                return False
+        elif not all(needle in value for value in values):
+            return False
+    return True
 
 def _quality(rows):
     required = ["案件編號", "縣市", "醫療機構名稱", "檢測項目名稱"]
@@ -16,6 +49,127 @@ def _quality(rows):
         series = case_id_series(case_id)
         series_counts[series] = series_counts.get(series, 0) + 1
     return {"rows": len(rows), "unique_case_ids": len(set(ids)), "duplicate_case_ids": len(ids) - len(set(ids)), "missing_required": sum(any(not r.get(k) for k in required) for r in rows), "case_id_series": series_counts}
+
+
+def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        raise typer.BadParameter("沒有可輸出的資料")
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+PORTAL_AUTHORITATIVE_FIELDS = (
+    "縣市",
+    "醫療機構名稱",
+    "檢測項目名稱",
+    "檢測項目類別",
+    "認證實驗室名稱",
+    "認證實驗室所屬機構",
+)
+
+
+def _merge_portal_record(existing: dict[str, str], portal: dict[str, str], sources: set[str]) -> dict[str, str]:
+    """Use portal for current registration identity, preserving legacy detail gaps."""
+    merged = dict(existing)
+    for key, value in portal.items():
+        if key in {"data_source", "data_sources"}:
+            continue
+        if key in PORTAL_AUTHORITATIVE_FIELDS:
+            if value:
+                merged[key] = value
+        elif not merged.get(key) and value:
+            merged[key] = value
+    merged["data_source"] = "portal_where"
+    merged["data_sources"] = ";".join(sorted(sources))
+    return merged
+
+
+def _merge_source_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Deduplicate by official case ID while retaining source provenance."""
+    merged: dict[str, dict[str, str]] = {}
+    for row in normalize_city_rows(rows):
+        item = dict(row)
+        case_id = normalize_case_id(item.get("案件編號", ""))
+        if not case_id:
+            continue
+        item["案件編號"] = case_id
+        source = item.get("data_source", "legacy_apy_list")
+        if case_id not in merged:
+            item["data_sources"] = source
+            merged[case_id] = item
+            continue
+        previous = merged[case_id]
+        sources = set(filter(None, previous.get("data_sources", "").split(";"))) | {source}
+        if source == "portal_where":
+            merged[case_id] = _merge_portal_record(previous, item, sources)
+            continue
+        if previous.get("data_source") == "portal_where":
+            # A later legacy row must never replace verified portal identity
+            # fields, but can still fill a portal blank such as price/target.
+            merged[case_id] = _merge_portal_record(item, previous, sources)
+            continue
+        # Preserve the fuller business row, but do not let provenance fields
+        # influence that comparison.
+        score = lambda value: sum(bool(cell) for key, cell in value.items() if key not in {"data_source", "data_sources"})
+        if score(item) > score(previous):
+            item["data_sources"] = ";".join(sorted(sources))
+            merged[case_id] = item
+        else:
+            previous["data_sources"] = ";".join(sorted(sources))
+    return list(merged.values())
+
+
+MATERIAL_PORTAL_FIELDS = (
+    "縣市",
+    "醫療機構名稱",
+    "檢測項目名稱",
+    "檢測項目類別",
+    "認證實驗室名稱",
+    "認證實驗室所屬機構",
+)
+
+
+def _portal_increment(
+    baseline_rows: list[dict[str, str]],
+    portal_rows: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Return new official case IDs and row-level material differences.
+
+    Case ID is the stable append key.  A changed-ID list is reported separately
+    for human review; this incremental workflow never overwrites an existing
+    case silently.  Empty portal fields and presentation-only price/target
+    differences are intentionally excluded because the portal often omits them.
+    """
+    baseline_by_id = {
+        normalize_case_id(row.get("案件編號", "")): row
+        for row in baseline_rows
+        if normalize_case_id(row.get("案件編號", ""))
+    }
+    new_rows: list[dict[str, str]] = []
+    changes: list[dict[str, str]] = []
+    for row in portal_rows:
+        case_id = normalize_case_id(row.get("案件編號", ""))
+        if not case_id:
+            continue
+        previous = baseline_by_id.get(case_id)
+        if previous is None:
+            new_rows.append(row)
+            continue
+        for field in MATERIAL_PORTAL_FIELDS:
+            portal_value = row.get(field, "")
+            baseline_value = previous.get(field, "")
+            if portal_value and _normalized_text(baseline_value) != _normalized_text(portal_value):
+                changes.append({
+                    "案件編號": case_id,
+                    "欄位": field,
+                    "baseline_value": baseline_value,
+                    "portal_value": portal_value,
+                })
+    return new_rows, changes
 
 @app.command("scrape")
 def scrape(
@@ -61,6 +215,21 @@ def scrape(
         query_path = client.save(url, query_html, "query")
         typer.echo(f"查詢結果 raw={query_path}")
         pages_meta.append({"page": 1, "kind": "query", "raw_path": str(query_path), "sha256": hashlib.sha256(query_html.encode()).hexdigest()})
+        try:
+            query_rows = parse_table(query_html)
+        except Exception as exc:
+            raise typer.BadParameter(f"查詢結果無法解析：{exc}") from exc
+        if any((city, institution, test_name, lab_name)) and not _query_result_is_verified(
+            query_rows,
+            city=city,
+            institution=institution,
+            test_name=test_name,
+            lab_name=lab_name,
+        ):
+            raise typer.BadParameter(
+                "網站未套用送出的篩選條件，改回傳未篩選預設清單；已中止以避免產生不完整或錯誤 CSV。"
+            "請保留輸出的 raw HTML 供複核。"
+            )
         current_html = query_html
     seen_ids = {normalize_case_id(r.get("案件編號", "")) for r in all_rows if r.get("案件編號")}
     duplicate_pages = []
@@ -117,6 +286,152 @@ def scrape(
     quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
     typer.echo(f"品質報告：{quality_path}")
     typer.echo(f"品質檢查：{_quality(all_rows)}")
+
+
+@app.command("scrape-portal")
+def scrape_portal(
+    city: str = typer.Option("", help="縣市"),
+    institution: str = typer.Option("", "--institution", help="醫療機構名稱"),
+    test_name: str = typer.Option("", "--test-name", help="檢測項目名稱"),
+    lab_name: str = typer.Option("", "--lab-name", help="認證實驗室名稱"),
+    category: list[str] = typer.Option(None, "--category", help="可重複指定檢測類別"),
+    output: Path = typer.Option(Path("data/processed/portal_records.csv")),
+    raw_output: Path = typer.Option(Path("data/raw/portal_query.json"), "--raw-output"),
+    insecure: bool = typer.Option(False, "--insecure", help="停用 TLS 憑證驗證；僅限憑證鏈問題時臨時使用"),
+):
+    """抓取官方 portal/Where JSON 資料；不覆寫舊入口資料。"""
+    if insecure:
+        typer.echo("警告：本次請求將停用 TLS 憑證驗證。")
+    client = PortalClient(verify=not insecure)
+    payload, rows = client.search(
+        city=city,
+        institution=institution,
+        test_name=test_name,
+        lab_name=lab_name,
+        categories=category or (),
+    )
+    raw_output.parent.mkdir(parents=True, exist_ok=True)
+    raw_output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    enriched = [enrich(row) for row in rows]
+    _write_csv(output, enriched)
+    quality = _quality(enriched)
+    quality.update({
+        "source": "portal_where",
+        "source_url": PORTAL_SEARCH_URL,
+        "raw_path": str(raw_output),
+        "filters": {"city": city, "institution": institution, "test_name": test_name, "lab_name": lab_name, "categories": category or []},
+    })
+    quality_path = output.with_name(output.stem + "_quality.json")
+    quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"portal raw：{raw_output}")
+    typer.echo(f"完成：{len(enriched)} 筆 -> {output}")
+    typer.echo(f"品質報告：{quality_path}")
+
+
+@app.command("update-portal")
+def update_portal(
+    baseline: Path = typer.Option(..., "--baseline", help="目前使用中的完整／合併 CSV"),
+    output: Path = typer.Option(Path("data/processed/portal_incremental.csv"), help="只包含本次新增案件的 CSV"),
+    merged_output: Path = typer.Option(None, "--merged-output", help="選填：寫出舊資料加新增案件的新合併 CSV，不覆寫 baseline"),
+    raw_output: Path = typer.Option(Path("data/raw/portal_update_snapshot.json"), "--raw-output", help="本次官方 portal 回應快照"),
+    category: list[str] = typer.Option(None, "--category", help="可重複指定類別；未指定則檢查全部類別"),
+    insecure: bool = typer.Option(False, "--insecure", help="停用 TLS 憑證驗證；僅限憑證鏈問題時臨時使用"),
+):
+    """以官方 portal 單次快照找出 baseline 中不存在的新案件。"""
+    if not baseline.exists():
+        raise typer.BadParameter(f"找不到 baseline CSV：{baseline}")
+    if insecure:
+        typer.echo("警告：本次請求將停用 TLS 憑證驗證。")
+    with baseline.open(encoding="utf-8-sig", newline="") as f:
+        baseline_rows = list(csv.DictReader(f))
+    baseline_ids = {
+        normalize_case_id(row.get("案件編號", ""))
+        for row in baseline_rows
+        if normalize_case_id(row.get("案件編號", ""))
+    }
+    if not baseline_ids:
+        raise typer.BadParameter("baseline CSV 沒有可辨識的案件編號")
+
+    client = PortalClient(verify=not insecure)
+    payload, portal_rows = client.search(categories=category or ())
+    raw_output.parent.mkdir(parents=True, exist_ok=True)
+    raw_output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    new_source_rows, change_rows = _portal_increment(baseline_rows, portal_rows)
+    new_rows = [enrich(row) for row in new_source_rows]
+    changed_ids = sorted({row["案件編號"] for row in change_rows})
+
+    if new_rows:
+        _write_csv(output, new_rows)
+        typer.echo(f"新增案件：{len(new_rows)} 筆 -> {output}")
+    else:
+        typer.echo("新增案件：0 筆（baseline 已包含本次 portal 快照的所有案件編號）")
+
+    if merged_output:
+        # Only append truly new IDs.  Existing records are intentionally left
+        # untouched, even when the portal reports changed fields.
+        merged = _merge_source_rows([*baseline_rows, *new_rows])
+        _write_csv(merged_output, merged)
+        typer.echo(f"更新後合併檔：{len(merged)} 筆 -> {merged_output}")
+
+    changes_path = output.with_name(output.stem + "_changed_existing.csv")
+    if change_rows:
+        _write_csv(changes_path, change_rows)
+        typer.echo(f"既有案件重要欄位差異：{len(change_rows)} 項／{len(changed_ids)} 案 -> {changes_path}")
+    else:
+        changes_path.write_text(
+            "案件編號,欄位,baseline_value,portal_value\n",
+            encoding="utf-8-sig",
+        )
+
+    quality = {
+        "source": "portal_where_incremental",
+        "source_url": PORTAL_SEARCH_URL,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "baseline": str(baseline),
+        "baseline_unique_case_ids": len(baseline_ids),
+        "portal_rows_checked": len(portal_rows),
+        "new_rows": len(new_rows),
+        "new_case_ids": [row["案件編號"] for row in new_source_rows],
+        "existing_case_ids_with_material_changes": changed_ids,
+        "material_change_count": len(changed_ids),
+        "material_field_change_count": len(change_rows),
+        "changes_path": str(changes_path),
+        "filters": {"categories": category or []},
+        "raw_path": str(raw_output),
+    }
+    quality_path = output.with_name(output.stem + "_quality.json")
+    quality_path.parent.mkdir(parents=True, exist_ok=True)
+    quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"官方快照：{raw_output}")
+    typer.echo(f"更新報告：{quality_path}")
+    if changed_ids:
+        typer.echo(f"注意：{len(changed_ids)} 筆既有案件的 portal 重要欄位不同；未自動覆寫，請查看更新報告。")
+
+
+@app.command("merge-sources")
+def merge_sources(
+    input_csv: list[Path] = typer.Option(..., "--input-csv", help="可重複指定舊入口或 portal CSV"),
+    output: Path = typer.Option(Path("data/processed/ldts_merged.csv")),
+):
+    """合併多來源 CSV，依案件編號去重並保留 data_sources。"""
+    missing = [str(path) for path in input_csv if not path.exists()]
+    if missing:
+        raise typer.BadParameter("找不到 CSV：" + ", ".join(missing))
+    rows: list[dict[str, str]] = []
+    for path in input_csv:
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            default_source = "portal_where" if "portal" in path.stem.casefold() else "legacy_apy_list"
+            for row in csv.DictReader(f):
+                row["data_source"] = row.get("data_source") or default_source
+                rows.append(row)
+    merged = _merge_source_rows(rows)
+    _write_csv(output, merged)
+    quality = _quality(merged)
+    quality.update({"input_csv": [str(path) for path in input_csv], "source_count": len(input_csv)})
+    quality_path = output.with_name(output.stem + "_quality.json")
+    quality_path.write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"合併：{len(rows)} 筆來源資料 -> {len(merged)} 筆唯一案件 -> {output}")
+    typer.echo(f"品質報告：{quality_path}")
 
 @app.command("scrape-batch")
 def scrape_batch(

@@ -1,3 +1,4 @@
+from ldts.cli import _query_result_is_verified
 from ldts.scraper.parser import case_id_series, normalize_case_id, parse_table
 
 def test_parse_wrapped_cells():
@@ -13,3 +14,9 @@ def test_case_id_variants_are_kept_distinct_and_supported():
     assert case_id_series("2024LDT0026") == "LDT"
     assert case_id_series("2023LDTB0064") == "LDTB"
     assert case_id_series("2026LDTS00053") == "LDTS"
+
+
+def test_query_verification_rejects_an_unfiltered_default_page():
+    rows = [{"縣市": "臺中市", "認證實驗室名稱": "其他實驗室"}]
+    assert not _query_result_is_verified(rows, city="新北市", institution="", test_name="", lab_name="")
+    assert not _query_result_is_verified(rows, city="", institution="", test_name="", lab_name="centogene")

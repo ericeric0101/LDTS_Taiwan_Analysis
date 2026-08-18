@@ -30,15 +30,37 @@ class Client:
         matches = sorted(self.raw_dir.glob(f"*_{label}.html"), key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0] if matches else None
 
-    def aspnet_postback(self, url: str, html: str, event_target: str, extra: dict[str, str] | None = None) -> str:
+    @staticmethod
+    def postback_data(html: str, event_target: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Build the same successful-control payload that a browser form submit uses."""
         soup = BeautifulSoup(html, "lxml")
-        data = {}
-        for node in soup.select("input[type=hidden][name]"):
-            data[node["name"]] = node.get("value", "")
+        data: dict[str, str] = {}
+        form = soup.select_one("form")
+        if not form:
+            raise ValueError("找不到 ASP.NET 表單")
+        for node in form.select("input[name], select[name], textarea[name]"):
+            if node.has_attr("disabled"):
+                continue
+            name = node["name"]
+            kind = (node.get("type") or "").lower()
+            if kind in {"submit", "button", "reset", "image", "file"}:
+                continue
+            if kind in {"checkbox", "radio"} and not node.has_attr("checked"):
+                continue
+            if node.name == "select":
+                option = node.select_one("option[selected]") or node.select_one("option")
+                data[name] = option.get("value", "") if option else ""
+            else:
+                data[name] = node.get("value", "") if node.name == "input" else node.get_text()
         data["__EVENTTARGET"] = event_target
         data["__EVENTARGUMENT"] = ""
         if extra:
             data.update(extra)
+
+        return data
+
+    def aspnet_postback(self, url: str, html: str, event_target: str, extra: dict[str, str] | None = None) -> str:
+        data = self.postback_data(html, event_target, extra)
         response = self.session.post(url, data=data, timeout=self.timeout, verify=self.verify)
         response.raise_for_status()
         text = response.content.decode(response.encoding or "utf-8", errors="replace")

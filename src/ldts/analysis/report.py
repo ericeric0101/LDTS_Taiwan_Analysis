@@ -22,12 +22,29 @@ def _percentile(values, p):
 
 def summarize(rows: list[dict]):
     def count(field): return Counter(r.get(field, "") for r in rows if r.get(field, ""))
+    def entity_counts(key_field, label_field):
+        grouped = Counter()
+        labels = defaultdict(Counter)
+        for row in rows:
+            key = row.get(key_field, "")
+            if not key:
+                continue
+            grouped[key] += 1
+            label = row.get(label_field, "") or row.get(key_field, "")
+            labels[key][label] += 1
+        return {
+            labels[key].most_common(1)[0][0]: value
+            for key, value in grouped.items()
+        }, grouped
     prices = [float(r["representative_price_twd"]) for r in rows if r.get("representative_price_twd")]
     city_counts = count("縣市")
     institution_city = defaultdict(set)
     for r in rows:
-        if r.get("縣市") and r.get("medical_institution_name_normalized"): institution_city[r["縣市"]].add(r["medical_institution_name_normalized"])
-    return {"rows": len(rows), "unique_case_ids": len({r.get("案件編號") for r in rows}), "institutions": len(count("medical_institution_name_normalized")), "laboratories": len(count("accredited_lab_name_normalized")), "categories": dict(count("檢測項目類別")), "median_price_twd": sorted(prices)[len(prices)//2] if prices else None, "institution_counts": dict(count("medical_institution_name_normalized")), "laboratory_counts": dict(count("accredited_lab_name_normalized")), "panel_size_counts": dict(count("panel_size_group")), "city_counts": dict(city_counts), "city_institutions": {k: len(v) for k,v in institution_city.items()}, "city_institution_names": {k: sorted(v) for k,v in institution_city.items()}}
+        if r.get("縣市") and r.get("medical_institution_name_key"):
+            institution_city[r["縣市"]].add(r["medical_institution_name_key"])
+    institution_counts, institution_keys = entity_counts("medical_institution_name_key", "medical_institution_name_normalized")
+    laboratory_counts, laboratory_keys = entity_counts("accredited_lab_name_key", "accredited_lab_name_normalized")
+    return {"rows": len(rows), "unique_case_ids": len({r.get("案件編號") for r in rows}), "institutions": len(institution_keys), "laboratories": len(laboratory_keys), "categories": dict(count("檢測項目類別")), "median_price_twd": sorted(prices)[len(prices)//2] if prices else None, "institution_counts": institution_counts, "laboratory_counts": laboratory_counts, "panel_size_counts": dict(count("panel_size_group")), "city_counts": dict(city_counts), "city_institutions": {k: len(v) for k,v in institution_city.items()}, "city_institution_names": {k: sorted(v) for k,v in institution_city.items()}}
 
 def build_report(input_csv: Path | list[Path], output_dir: Path, categories: list[str] | None = None, reference_year: int | None = None) -> Path:
     paths = input_csv if isinstance(input_csv, list) else [input_csv]
@@ -45,8 +62,8 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
         if not row.get("application_year"):
             continue
         key = (
-            row.get("medical_institution_name_normalized", ""),
-            row.get("accredited_lab_name_normalized", ""),
+            row.get("medical_institution_name_key", ""),
+            row.get("accredited_lab_name_key", ""),
             normalize_test_name(str(row.get("檢測項目名稱", ""))),
         )
         if all(key):
@@ -55,22 +72,29 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
     for matched_rows in tracking_groups.values():
         newest_year = max(int(row["application_year"]) for row in matched_rows)
         for row in matched_rows:
-            if int(row["application_year"]) != newest_year:
-                continue
             elapsed = int(row.get("years_since_application") or 0)
-            if elapsed >= 3:
+            application_year = int(row["application_year"])
+            if application_year != newest_year:
+                status, label = "renewed", f"已見更新・{application_year}"
+                inference = f"同一機構／實驗室／檢測組合已見 {newest_year} 年案件"
+            elif elapsed >= 3:
                 status, label = "opportunity", f"機會・{int(row['application_year'])}・第 {elapsed} 年"
+                inference = "目前資料未見較新相同機構／實驗室／檢測案件；待確認"
             elif elapsed == 2:
                 status, label = "observe", f"觀察・{int(row['application_year'])}・第 2 年"
+                inference = "持續追蹤"
             else:
                 status, label = "safe", f"安全・{int(row['application_year'])}・近期"
+                inference = "持續追蹤"
             tracking_rows.append({
-                "case_id": row.get("案件編號", ""), "institution": row.get("醫療機構名稱", ""),
-                "laboratory": row.get("認證實驗室名稱", ""), "test": row.get("檢測項目名稱", ""),
+                "case_id": row.get("案件編號", ""), "institution": row.get("medical_institution_name_normalized", ""),
+                "institution_key": row.get("medical_institution_name_key", ""),
+                "laboratory": row.get("accredited_lab_name_normalized", ""),
+                "laboratory_key": row.get("accredited_lab_name_key", ""), "test": row.get("檢測項目名稱", ""),
                 "city": row.get("縣市", ""), "category": row.get("檢測項目類別", ""),
-                "application_year": int(row["application_year"]), "years_since_application": elapsed,
+                "application_year": application_year, "years_since_application": elapsed,
                 "status": status, "status_label": label,
-                "inference": "目前資料未見較新相同機構／實驗室／檢測案件；待確認" if status == "opportunity" else "持續追蹤",
+                "inference": inference,
             })
     tracking_rows.sort(key=lambda row: (-row["years_since_application"], row["institution"], row["test"]))
     tracking_candidates = [row for row in tracking_rows if row["status"] == "opportunity"]
@@ -80,6 +104,11 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
         "three_or_more_years": sum(row["years_since_application"] >= 3 for row in tracking_rows),
     }
     summary = summarize(rows); output_dir.mkdir(parents=True, exist_ok=True)
+    application_year_counts = Counter(
+        int(row["application_year"])
+        for row in rows
+        if row.get("application_year")
+    )
     all_cities = ["臺北市","新北市","桃園市","臺中市","臺南市","高雄市","基隆市","新竹市","嘉義市","新竹縣","苗栗縣","彰化縣","南投縣","雲林縣","嘉義縣","屏東縣","宜蘭縣","花蓮縣","臺東縣","澎湖縣","金門縣","連江縣"]
     city_summary = [{"city": city, "case_count": summary["city_counts"].get(city, 0), "institution_count": summary["city_institutions"].get(city, 0)} for city in all_cities]
     groups = defaultdict(list)
@@ -89,18 +118,25 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
     panel_prices = []
     for group, values in sorted(groups.items()):
         panel_prices.append({"panel_size_group": group, "count": len(values), "min_twd": min(values) if values else "", "p25_twd": _percentile(values, .25), "median_twd": _percentile(values, .5), "p75_twd": _percentile(values, .75), "max_twd": max(values) if values else ""})
-    edges = Counter((r.get("medical_institution_name_normalized", ""), r.get("accredited_lab_name_normalized", "")) for r in rows if r.get("medical_institution_name_normalized") and r.get("accredited_lab_name_normalized"))
+    edges = Counter((r.get("medical_institution_name_key", ""), r.get("accredited_lab_name_key", "")) for r in rows if r.get("medical_institution_name_key") and r.get("accredited_lab_name_key"))
     institutions = sorted({a for a,b in edges}); laboratories = sorted({b for a,b in edges})
     def display_name(value: str) -> str:
         return " ".join((value or "").split()).replace("台", "臺")
     network = {"edges": [{"institution": a, "laboratory": b, "count": n} for (a,b), n in edges.items()], "institutions": institutions, "laboratories": laboratories,
-               "rows": [{"city": r.get("縣市", ""), "institution": r.get("medical_institution_name_normalized", ""), "institution_display": display_name(r.get("醫療機構名稱", "")) or r.get("medical_institution_name_normalized", ""), "laboratory": r.get("accredited_lab_name_normalized", ""), "laboratory_display": display_name(r.get("認證實驗室名稱", "")) or r.get("accredited_lab_name_normalized", ""), "test": r.get("檢測項目名稱", ""), "category": r.get("檢測項目類別", ""), "panel": r.get("panel_size_group", ""), "price": r.get("費用(新台幣)", r.get("費用（新台幣）", ""))} for r in rows]}
+               "rows": [{"city": r.get("縣市", ""), "institution": r.get("medical_institution_name_key", ""), "institution_display": display_name(r.get("醫療機構名稱", "")) or r.get("medical_institution_name_normalized", ""), "laboratory": r.get("accredited_lab_name_key", ""), "laboratory_display": display_name(r.get("認證實驗室名稱", "")) or r.get("accredited_lab_name_normalized", ""), "test": r.get("檢測項目名稱", ""), "category": r.get("檢測項目類別", ""), "panel": r.get("panel_size_group", ""), "application_year": r.get("application_year", ""), "price": r.get("費用(新台幣)", r.get("費用（新台幣）", ""))} for r in rows]}
     _write(output_dir / "institutions.csv", [{"institution": k, "case_count": v} for k,v in summary["institution_counts"].items()])
     _write(output_dir / "laboratories.csv", [{"laboratory": k, "case_count": v} for k,v in summary["laboratory_counts"].items()])
     _write(output_dir / "categories.csv", [{"category": k, "case_count": v} for k,v in summary["categories"].items()])
     _write(output_dir / "panel_sizes.csv", [{"panel_size_group": k, "case_count": v} for k,v in summary["panel_size_counts"].items()])
     _write(output_dir / "panel_price_summary.csv", panel_prices)
     _write(output_dir / "city_summary.csv", city_summary)
+    _write(
+        output_dir / "application_year_summary.csv",
+        [
+            {"application_year": year, "case_count": count}
+            for year, count in sorted(application_year_counts.items())
+        ],
+    )
     _write(output_dir / "application_year_tracking.csv", tracking_rows)
     def table(title, mapping, table_id):
         body = "".join(f"<tr><td>{html.escape(str(k))}</td><td>{v}</td></tr>" for k,v in mapping.items())
@@ -122,13 +158,13 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
     )
     tracking_stat_cards = (
         '<div class="tracking-stat-grid">'
-        f'<div class="tracking-stat total"><span class="value">{tracking_stats["total"]}</span><span class="label">最新追蹤案件</span></div>'
+        f'<div class="tracking-stat total"><span class="value">{tracking_stats["total"]}</span><span class="label">可追蹤案件</span></div>'
         f'<div class="tracking-stat recent"><span class="value">{tracking_stats["recent_three_years"]}</span><span class="label">近三年申請（{reference_year - 2}–{reference_year}）</span></div>'
         f'<div class="tracking-stat opportunity"><span class="value">{tracking_stats["three_or_more_years"]}</span><span class="label">三年以上、未見更新</span></div>'
         '</div>'
     )
     city_coords = {"臺北市":[25.0375,121.5637],"新北市":[25.0169,121.4628],"桃園市":[24.9937,121.3010],"臺中市":[24.1477,120.6736],"臺南市":[22.9997,120.2270],"高雄市":[22.6273,120.3014],"基隆市":[25.1276,121.7392],"新竹市":[24.8138,120.9675],"嘉義市":[23.4801,120.4491],"新竹縣":[24.8387,121.0177],"苗栗縣":[24.5602,120.8214],"彰化縣":[24.0518,120.5161],"南投縣":[23.9609,120.9719],"雲林縣":[23.7092,120.4313],"嘉義縣":[23.4589,120.5740],"屏東縣":[22.5519,120.5487],"宜蘭縣":[24.7021,121.7378],"花蓮縣":[23.9911,121.6112],"臺東縣":[22.7554,121.1500],"澎湖縣":[23.5711,119.5793],"金門縣":[24.4493,118.3767],"連江縣":[26.1605,119.9510]}
-    chart_data = json.dumps({"institutions": summary["institution_counts"], "laboratories": summary["laboratory_counts"], "categories": summary["categories"], "panel_sizes": summary["panel_size_counts"], "city_counts": summary["city_counts"], "city_institutions": summary["city_institutions"], "city_institution_names": summary["city_institution_names"], "city_coords": city_coords, "network": network, "year_tracking_candidates": tracking_candidates}, ensure_ascii=False)
+    chart_data = json.dumps({"institutions": summary["institution_counts"], "laboratories": summary["laboratory_counts"], "categories": summary["categories"], "panel_sizes": summary["panel_size_counts"], "application_year_counts": dict(sorted(application_year_counts.items())), "city_counts": summary["city_counts"], "city_institutions": summary["city_institutions"], "city_institution_names": summary["city_institution_names"], "city_coords": city_coords, "network": network, "year_tracking_candidates": tracking_candidates, "year_tracking_records": tracking_rows}, ensure_ascii=False)
     price_table = '<div class="table-card"><div class="table-scroll"><table id="panel_price_table"><thead><tr><th>Panel 分組</th><th>案件數</th><th>最低價</th><th>P25</th><th>中位數</th><th>P75</th><th>最高價</th></tr></thead><tbody>' + "".join(f"<tr><td>{html.escape(str(x['panel_size_group']))}</td><td>{x['count']}</td><td>{x['min_twd']}</td><td>{x['p25_twd']}</td><td>{x['median_twd']}</td><td>{x['p75_twd']}</td><td>{x['max_twd']}</td></tr>" for x in panel_prices) + "</tbody></table></div></div>"
     report = f'''<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LDTS 臺灣市場分析儀表板</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -141,7 +177,7 @@ def build_report(input_csv: Path | list[Path], output_dir: Path, categories: lis
 <section id="year-tracking" class="dashboard-section"><div class="section-heading"><div><h2>年份追蹤與續約候選</h2><p>基準年：{reference_year}。紅色僅代表目前資料未見較新相同機構／實驗室／檢測案件，並非未續約或逾期的事實。</p></div></div>{tracking_stat_cards}<div class="toolbar"><span class="year-badge safe">安全・近期</span><span class="year-badge observe">觀察・第 2 年</span><span class="year-badge opportunity">機會・第 3 年以上未見更新</span></div><div class="candidate-heading"><div><h3>三年以上、未見更新候選名單</h3><p class="method-note">可搜尋案件編號、機構、實驗室與檢測名稱；下載檔案僅包含目前篩選結果。</p></div><span id="tracking_count" class="candidate-count"></span></div><div class="tracking-controls"><label>搜尋<input id="tracking_search" type="search" placeholder="案件編號、機構、實驗室、檢測名稱"></label><label>縣市<select id="tracking_city"><option value="ALL">全部縣市</option></select></label><label>檢測類別<select id="tracking_category"><option value="ALL">全部類別</option></select></label><label>認證實驗室<select id="tracking_laboratory"><option value="ALL">全部實驗室</option></select></label><label>每頁<select id="tracking_page_size"><option value="25">25 筆</option><option value="50">50 筆</option><option value="100">100 筆</option></select></label><button id="tracking_download" type="button">下載目前篩選 CSV</button></div><div class="table-card"><div class="table-scroll tracking-scroll"><table id="tracking_candidates_table"><thead><tr><th>案件編號</th><th>縣市</th><th>醫療機構</th><th>認證實驗室</th><th>檢測項目</th><th>年度狀態</th></tr></thead><tbody id="tracking_candidates_body"></tbody></table></div></div><div id="tracking_pager" class="tracking-pager" aria-label="候選名單分頁"></div></section>
 <section id="portfolio" class="dashboard-section"><div class="section-heading"><div><h2>合作網絡與 Portfolio Explorer</h2><p>醫療機構—認證實驗室登記關係；非檢體量或營收網絡。</p></div></div><div class="toolbar"><label for="city_filter">縣市篩選</label><select id="city_filter"><option value="ALL">全部縣市</option></select><span id="chart_controls"></span><span class="network-zoom" aria-label="合作網絡大小"><span>網絡大小</span><button id="network_zoom_out" type="button" aria-label="縮小網絡">−</button><output id="network_zoom_value">100%</output><button id="network_zoom_in" type="button" aria-label="放大網絡">＋</button></span><label for="entity_search">選擇或搜尋機構／實驗室</label><select id="entity" style="display:none"></select><input id="entity_search" type="search" list="entity_options" placeholder="輸入名稱搜尋或選擇建議" autocomplete="off"><datalist id="entity_options"></datalist></div><div id="entity_city_coverage" class="coverage-note coverage-block" aria-live="polite"></div><div class="chart-card"><div id="network" class="chart"></div></div><div id="details" class="details-card"></div></section>
 <section id="top10" class="dashboard-section"><div class="section-heading"><div><h2>Top 10 分佈</h2><p>依全臺案件數呈現醫療機構與認證實驗室。</p></div></div><div id="portfolio_pies"><div class="chart-card"><div id="top10_institutions" class="chart"></div></div><div class="chart-card"><div id="top10_laboratories" class="chart"></div></div></div></section>
-<section id="distribution" class="dashboard-section"><div class="section-heading"><div><h2>案件數分佈</h2><p>縣市篩選與上方顯示範圍設定會同步更新以下互動圖表。</p></div></div><div class="chart-grid"><div class="chart-card"><div id="institutions" class="chart"></div></div><div class="chart-card"><div id="laboratories" class="chart"></div></div><div class="chart-card"><div id="categories" class="chart"></div></div><div class="chart-card"><div id="panel_sizes" class="chart"></div></div></div></section>
+<section id="distribution" class="dashboard-section"><div class="section-heading"><div><h2>案件數分佈</h2><p>縣市篩選與上方顯示範圍設定會同步更新以下互動圖表。</p></div></div><div class="chart-grid"><div class="chart-card"><div id="institutions" class="chart"></div></div><div class="chart-card"><div id="laboratories" class="chart"></div></div><div class="chart-card"><div id="categories" class="chart"></div></div><div class="chart-card"><div id="panel_sizes" class="chart"></div></div><div class="chart-card"><div id="application_years" class="chart"></div></div></div></section>
 <section id="categories-table" class="dashboard-section"><div class="section-heading"><div><h2>檢測類別</h2><p>指定分析資料中的檢測項目類別案件數。</p></div></div>{table('檢測類別', summary['categories'], 'categories_table')}</section>
 <section id="panel" class="dashboard-section"><div class="section-heading"><div><h2>Panel size 與價格</h2><p>價格摘要僅使用已成功解析的 representative price。</p></div></div><div class="table-grid">{table('Panel size', summary['panel_size_counts'], 'panel_size_table')}{price_table}</div></section>
 <section id="map-section" class="dashboard-section"><div class="section-heading"><div><h2>登記縣市簡圖</h2><p>機構點為同縣市內的示意分散位置，非實際地址或經緯度。</p></div></div><div id="map"></div></section>
@@ -154,7 +190,8 @@ function counts(rows,key){{const out={{}};rows.forEach(r=>{{if(r[key])out[r[key]
 const topSelect=document.createElement('select'); topSelect.id='top_n'; ['10','20','ALL'].forEach(v=>{{const o=document.createElement('option');o.value=v;o.textContent=v==='ALL'?'全部':'Top '+v;topSelect.appendChild(o);}}); document.getElementById('chart_controls').append('顯示範圍：',topSelect);
 function limited(obj){{const n=topSelect.value==='ALL'?999999:Number(topSelect.value);return Object.fromEntries(Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n));}}
 function bar(id,title,obj) {{ const limitedObj=(id==='categories'||id==='panel_sizes')?obj:limited(obj), labels=Object.keys(limitedObj), values=Object.values(limitedObj); Plotly.react(id,[{{x:values,y:labels,type:'bar',orientation:'h',text:values,textposition:'auto',marker:{{color:'#168aad'}}}}],{{title,margin:{{l:220,r:30,t:60,b:45}},xaxis:{{title:'案件數'}},yaxis:{{automargin:true}}}},{{responsive:true,displaylogo:false}}); }}
-function drawCharts(){{const rows=filteredRows();bar('institutions','醫療機構案件數',counts(rows,'institution'));bar('laboratories','認證實驗室案件數',counts(rows,'laboratory'));bar('categories','檢測類別案件數',counts(rows,'category'));bar('panel_sizes','Panel size 案件數',counts(rows,'panel'));}}
+function yearBar(rows){{const yearCounts=counts(rows.filter(row=>row.application_year),'application_year'),years=Object.keys(yearCounts).sort((a,b)=>Number(a)-Number(b)),values=years.map(year=>yearCounts[year]);Plotly.react('application_years',[{{x:years,y:values,type:'bar',text:values,textposition:'auto',marker:{{color:'#0f766e'}}}}],{{title:'各年度申請案件數',margin:{{l:55,r:25,t:60,b:55}},xaxis:{{title:'申請年份',type:'category'}},yaxis:{{title:'案件數',rangemode:'tozero'}},hovermode:'x unified'}},{{responsive:true,displaylogo:false}});}}
+function drawCharts(){{const rows=filteredRows();bar('institutions','醫療機構案件數',counts(rows,'institution'));bar('laboratories','認證實驗室案件數',counts(rows,'laboratory'));bar('categories','檢測類別案件數',counts(rows,'category'));bar('panel_sizes','Panel size 案件數',counts(rows,'panel'));yearBar(rows);}}
 function displayMap(rows,key,displayKey){{const map=new Map();rows.forEach(r=>{{if(r[key]&&!map.has(r[key]))map.set(r[key],r[displayKey]||r[key]);}});return map;}}
 function drawNetwork(){{const base=filteredRows(), n=topSelect.value==='ALL'?999999:Number(topSelect.value), ic=counts(base,'institution'), topInstitutions=new Set(Object.keys(ic).sort((a,b)=>ic[b]-ic[a]).slice(0,n)), [kind,name]=select.value?select.value.split('|'):['',''], focused=entityNetworkFocus&&name, rows=focused?base.filter(r=>kind==='醫療機構'?r.institution===name:r.laboratory===name):(topSelect.value==='ALL'?base:base.filter(r=>topInstitutions.has(r.institution))), institutionDisplays=displayMap(rows,'institution','institution_display'), laboratoryDisplays=displayMap(rows,'laboratory','laboratory_display'), edges={{}};rows.forEach(r=>{{if(r.institution&&r.laboratory){{const k=r.institution+'|||'+r.laboratory;edges[k]=(edges[k]||0)+1;}}}});const pairs=Object.entries(edges).map(([k,count])=>{{const [institution,laboratory]=k.split('|||');return {{institution,laboratory,count}};}}),ins=[...new Set(pairs.map(e=>e.institution))],labs=[...new Set(pairs.map(e=>e.laboratory))],nodeKeys=[...ins,...labs],nodeLabels=nodeKeys.map(key=>institutionDisplays.get(key)||laboratoryDisplays.get(key)||key),idx=new Map(nodeKeys.map((x,i)=>[x,i])),networkHeight=Math.min(2600,Math.round(Math.max(470,nodeKeys.length*18+140)*networkScale));window._networkPairs=pairs;window._networkNodes=nodeKeys;window._networkNodeLabels=nodeLabels;const rendered=Plotly.react('network',[{{type:'sankey',orientation:'h',node:{{label:nodeLabels,pad:Math.round(12*networkScale),thickness:Math.round(16*networkScale),color:nodeKeys.map((x,i)=>i<ins.length?'#168aad':'#f08c46')}},link:{{source:pairs.map(e=>idx.get(e.institution)),target:pairs.map(e=>idx.get(e.laboratory)),value:pairs.map(e=>e.count),label:pairs.map(e=>e.count+' 案'),color:pairs.map(()=> '#b8c4ce')}}}}],{{title:focused?'選定對象的合作網絡':'Top 醫療機構的全部合作網絡',height:networkHeight,font:{{size:Math.round(12*networkScale)}},margin:{{t:70,r:260,l:220,b:40}},hoverlabel:{{align:'left',namelength:-1}}}},{{responsive:true,displaylogo:false}});if(rendered&&typeof rendered.then==='function')rendered.then(attachNetworkInteractions);else setTimeout(attachNetworkInteractions,0);}}
 const select=document.getElementById('entity'), entitySearch=document.getElementById('entity_search'), entityOptions=document.getElementById('entity_options'), zoomOut=document.getElementById('network_zoom_out'), zoomIn=document.getElementById('network_zoom_in'), zoomValue=document.getElementById('network_zoom_value');let entityNetworkFocus=false,networkScale=1;
@@ -173,6 +210,7 @@ function attachNetworkInteractions(){{const networkElement=document.getElementBy
 const trackingCandidates=data.year_tracking_candidates||[],trackingSearch=document.getElementById('tracking_search'),trackingCity=document.getElementById('tracking_city'),trackingCategory=document.getElementById('tracking_category'),trackingLaboratory=document.getElementById('tracking_laboratory'),trackingPageSize=document.getElementById('tracking_page_size'),trackingBody=document.getElementById('tracking_candidates_body'),trackingPager=document.getElementById('tracking_pager'),trackingCount=document.getElementById('tracking_count');let trackingPage=1;
 function trackingKey(value){{return String(value||'').toLocaleLowerCase().replace(/[\\s　]+/g,'');}}
 function addTrackingOptions(element,values){{[...new Set(values.filter(Boolean))].sort((a,b)=>a.localeCompare(b,'zh-Hant')).forEach(value=>{{const option=document.createElement('option');option.value=value;option.textContent=value;element.appendChild(option);}});}}
+function addTrackingEntityOptions(element,records,keyField,labelField){{const labels=new Map();records.forEach(record=>{{const key=record[keyField],label=record[labelField];if(key&&label&&!labels.has(key))labels.set(key,label);}});[...labels.entries()].sort((a,b)=>a[1].localeCompare(b[1],'zh-Hant')).forEach(([key,label])=>element.append(new Option(label,key)));}}
 addTrackingOptions(trackingCity,trackingCandidates.map(row=>row.city));addTrackingOptions(trackingCategory,trackingCandidates.map(row=>row.category));addTrackingOptions(trackingLaboratory,trackingCandidates.map(row=>row.laboratory));
 function filteredTrackingCandidates(){{const query=trackingKey(trackingSearch.value),city=trackingCity.value,category=trackingCategory.value,laboratory=trackingLaboratory.value;return trackingCandidates.filter(row=>{{const combined=trackingKey([row.case_id,row.institution,row.laboratory,row.test].join(' '));return (!query||combined.includes(query))&&(city==='ALL'||row.city===city)&&(category==='ALL'||row.category===category)&&(laboratory==='ALL'||row.laboratory===laboratory);}});}}
 function renderTrackingCandidates(page=1){{const rows=filteredTrackingCandidates(),size=Number(trackingPageSize.value),pages=Math.max(1,Math.ceil(rows.length/size));trackingPage=Math.min(Math.max(1,page),pages);trackingCount.textContent='篩選後 '+rows.length+' 件／候選 '+trackingCandidates.length+' 件';const shown=rows.slice((trackingPage-1)*size,trackingPage*size);trackingBody.innerHTML=shown.length?shown.map(row=>'<tr><td><span class="case-id">'+escapeHtml(row.case_id)+'</span></td><td>'+escapeHtml(row.city)+'</td><td>'+escapeHtml(row.institution)+'</td><td>'+escapeHtml(row.laboratory)+'</td><td>'+escapeHtml(row.test)+'</td><td><span class="year-badge '+escapeHtml(row.status)+'">'+escapeHtml(row.status_label)+'</span><small class="tracking-inference">'+escapeHtml(row.inference)+'</small></td></tr>').join(''):'<tr><td colspan="6">沒有符合條件的候選案件。</td></tr>';trackingPager.innerHTML='<button type="button" '+(trackingPage===1?'disabled':'')+'>上一頁</button><span>第 '+trackingPage+'／'+pages+' 頁</span><button type="button" '+(trackingPage===pages?'disabled':'')+'>下一頁</button>';const buttons=trackingPager.querySelectorAll('button');buttons[0].addEventListener('click',()=>renderTrackingCandidates(trackingPage-1));buttons[1].addEventListener('click',()=>renderTrackingCandidates(trackingPage+1));}}
@@ -183,6 +221,23 @@ const navToggle=document.querySelector('.nav-toggle'), navLinks=document.querySe
 const map=L.map('map').setView([23.75,120.95],7); L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'© OpenStreetMap contributors'}}).addTo(map);
 Object.entries(data.city_coords).forEach(([city, pos])=>{{ if(!data.city_counts[city]) return; const n=data.city_counts[city], m=data.city_institutions[city]||0; L.circleMarker(pos,{{radius:Math.max(7,Math.min(22,5+n*1.4)),color:'#168aad',fillOpacity:.65}}).addTo(map).bindPopup(city+'<br>案件數：'+n+'<br>醫療機構數：'+m); }});
 Object.entries(data.city_institution_names).forEach(([city, names])=>{{ const base=data.city_coords[city]; if(!base) return; names.forEach((name,i)=>{{ const a=(i*2.399)%6.28, d=.018+((i*7)%5)*.006; L.circleMarker([base[0]+Math.sin(a)*d,base[1]+Math.cos(a)*d],{{radius:4,color:'#f08c46',fillOpacity:.7}}).addTo(map).bindPopup(city+'<br>示意機構：'+name+'<br><small>非實際地址</small>'); }}); }});
+// 年份追蹤預設顯示所有可辨識年份的案件；續約候選只是其中一種狀態。
+const trackingRecords=data.year_tracking_records||[];
+document.querySelector('#year-tracking .section-heading p').textContent='可依申請年份、認證實驗室（公司）、縣市與狀態查看所有可辨識年份的案件；紅色為續約追蹤推論，不是逾期事實。';
+document.querySelector('#year-tracking .candidate-heading h3').textContent='年份追蹤案件清單';
+document.querySelector('#year-tracking .candidate-heading p').textContent='可依年份、公司、案件編號、機構與檢測名稱篩選；下載檔案僅包含目前篩選結果。';
+const trackingControls=document.querySelector('.tracking-controls');
+function insertTrackingSelect(id,labelText){{const label=document.createElement('label'),caption=document.createElement('span'),select=document.createElement('select');caption.textContent=labelText;select.id=id;label.append(caption,select);trackingControls.insertBefore(label,trackingPageSize.parentElement);return select;}}
+const trackingYear=insertTrackingSelect('tracking_year','申請年份'),trackingStatus=insertTrackingSelect('tracking_status','追蹤狀態');
+trackingYear.append(new Option('全部年份','ALL'));
+[...new Set(trackingRecords.map(row=>row.application_year).filter(Boolean))].sort((a,b)=>b-a).forEach(year=>trackingYear.append(new Option(String(year),String(year))));
+trackingStatus.append(new Option('全部狀態','ALL'),new Option('安全／近期','safe'),new Option('觀察／第 2 年','observe'),new Option('機會／三年以上未見更新','opportunity'),new Option('已見較新案件','renewed'));
+[trackingCity,trackingCategory,trackingLaboratory].forEach(element=>{{element.length=1;}});
+addTrackingOptions(trackingCity,trackingRecords.map(row=>row.city));addTrackingOptions(trackingCategory,trackingRecords.map(row=>row.category));addTrackingEntityOptions(trackingLaboratory,trackingRecords,'laboratory_key','laboratory');
+function filteredTrackingRecords(){{const query=trackingKey(trackingSearch.value),city=trackingCity.value,category=trackingCategory.value,laboratory=trackingLaboratory.value,year=trackingYear.value,status=trackingStatus.value;return trackingRecords.filter(row=>{{const combined=trackingKey([row.case_id,row.institution,row.laboratory,row.test].join(' '));return (!query||combined.includes(query))&&(city==='ALL'||row.city===city)&&(category==='ALL'||row.category===category)&&(laboratory==='ALL'||row.laboratory_key===laboratory)&&(year==='ALL'||String(row.application_year)===year)&&(status==='ALL'||row.status===status);}});}}
+function renderTrackingRecords(page=1){{const rows=filteredTrackingRecords(),size=Number(trackingPageSize.value),pages=Math.max(1,Math.ceil(rows.length/size));trackingPage=Math.min(Math.max(1,page),pages);trackingCount.textContent='篩選後 '+rows.length+' 件／可追蹤 '+trackingRecords.length+' 件';const shown=rows.slice((trackingPage-1)*size,trackingPage*size);trackingBody.innerHTML=shown.length?shown.map(row=>'<tr><td><span class="case-id">'+escapeHtml(row.case_id)+'</span></td><td>'+escapeHtml(row.city)+'</td><td>'+escapeHtml(row.institution)+'</td><td>'+escapeHtml(row.laboratory)+'</td><td>'+escapeHtml(row.test)+'</td><td><span class="year-badge '+escapeHtml(row.status)+'">'+escapeHtml(row.status_label)+'</span><small class="tracking-inference">'+escapeHtml(row.inference)+'</small></td></tr>').join(''):'<tr><td colspan="6">沒有符合條件的案件。</td></tr>';trackingPager.innerHTML='<button type="button" '+(trackingPage===1?'disabled':'')+'>上一頁</button><span>第 '+trackingPage+'／'+pages+' 頁</span><button type="button" '+(trackingPage===pages?'disabled':'')+'>下一頁</button>';const buttons=trackingPager.querySelectorAll('button');buttons[0].addEventListener('click',()=>renderTrackingRecords(trackingPage-1));buttons[1].addEventListener('click',()=>renderTrackingRecords(trackingPage+1));}}
+const oldTrackingDownload=document.getElementById('tracking_download'),trackingDownload=oldTrackingDownload.cloneNode(true);oldTrackingDownload.replaceWith(trackingDownload);trackingDownload.addEventListener('click',()=>{{const columns=[['案件編號','case_id'],['縣市','city'],['醫療機構','institution'],['認證實驗室','laboratory'],['檢測項目','test'],['申請年','application_year'],['年度狀態','status_label'],['推論','inference']],rows=filteredTrackingRecords(),csv=[columns.map(column=>csvCell(column[0])).join(','),...rows.map(row=>columns.map(([,key])=>csvCell(row[key])).join(','))].join('\\r\\n'),blob=new Blob(['\ufeff'+csv],{{type:'text/csv;charset=utf-8'}}),link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='ldts_year_tracking_filtered.csv';link.click();URL.revokeObjectURL(link.href);}});
+[trackingSearch,trackingCity,trackingCategory,trackingLaboratory,trackingYear,trackingStatus,trackingPageSize].forEach(element=>element.addEventListener(element===trackingSearch?'input':'change',()=>renderTrackingRecords(1)));renderTrackingRecords();
 </script></html>''')
     path = output_dir / "ldts_analysis_report.html"; path.write_text(report, encoding="utf-8")
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

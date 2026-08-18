@@ -1,4 +1,4 @@
-from ldts.processing.cleaner import parse_application_year, parse_price, parse_genes, normalize_name, normalize_test_name
+from ldts.processing.cleaner import canonical_entity_name, parse_application_year, parse_price, parse_genes, normalize_entity_key, normalize_name, normalize_test_name
 
 def test_price_range():
     x = parse_price("血液：4,000 元")
@@ -16,6 +16,18 @@ def test_non_gene_terms_are_excluded():
 
 def test_normalize_name():
     assert normalize_name(" 台灣 生醫 ") == "臺灣生醫"
+
+
+def test_entity_key_ignores_whitespace_but_display_name_can_keep_english_spacing():
+    assert normalize_entity_key("和平婦產科診所 細胞遺傳實驗室") == normalize_entity_key("和平婦產科診所細胞遺傳實驗室")
+    assert normalize_entity_key("和平婦產科診所細胞遺傳實驗是") == normalize_entity_key("和平婦產科診所細胞遺傳實驗室")
+    assert normalize_entity_key("Centogene GmbH") == normalize_entity_key("CentogeneGmbH")
+
+
+def test_reviewed_laboratory_aliases_share_a_canonical_name():
+    assert canonical_entity_name("大安聯合醫事檢驗所特殊生化組實驗室", "accredited_laboratories") == "大安聯合醫事檢驗所特殊生化實驗室"
+    assert canonical_entity_name("行動基因臨床分子醫學實驗室(ACT Genomics Laboratory)", "accredited_laboratories") == "行動基因臨床分子醫學實驗室"
+    assert canonical_entity_name("ACT Genomics Laboratory(行動基因臨床分子醫學實驗室)", "accredited_laboratories") == "行動基因臨床分子醫學實驗室"
 
 def test_zero_gene_count_is_unknown():
     from ldts.processing.cleaner import enrich
